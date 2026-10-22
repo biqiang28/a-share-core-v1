@@ -1,106 +1,133 @@
 import datetime as dt
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='A股二板成核2.2｜原型',page_icon='📈',layout='wide')
-st.title('A股二板成核2.2｜自动筛选原型 V1.0')
-st.caption('免费数据 · 盘后研究 · 不接券商、不自动交易、不提供实时买点')
+st.set_page_config(page_title='二板次日统计｜原型', page_icon='📊', layout='wide')
+st.title('二板次日表现统计｜原型 V0.1')
+st.caption('免费数据 · 仅统计历史表现 · 不输出买入结论')
 
-@st.cache_data(ttl=900,show_spinner=False)
-def load_pool(day):
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_zt(day_str):
     import akshare as ak
-    data=ak.stock_zt_pool_em(date=day.strftime('%Y%m%d'))
-    if data is None or data.empty:
-        raise ValueError('该日期未返回涨停池数据，可能是非交易日、尚未收盘或接口暂时不可用。')
-    return data
+    return ak.stock_zt_pool_em(date=day_str)
 
-def numeric(s):
-    return pd.to_numeric(s,errors='coerce')
 
-def time_num(s):
-    v=str(s).replace(':','').strip().split('.')[0]
-    if v.isdigit():
-        return int(v.zfill(6))
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_prev(day_str):
+    import akshare as ak
+    return ak.stock_zt_pool_previous_em(date=day_str)
+
+
+def pick_col(df, candidates):
+    """在候选字段名中找到实际存在的第一个，找不到返回 None。"""
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
-def analyze(df):
-    required=['代码','名称','连板数']
-    absent=[c for c in required if c not in df.columns]
-    if absent:
-        raise ValueError('数据字段发生变化，缺少：'+ '、'.join(absent))
-    pool=df.copy()
-    pool['连板数']=numeric(pool['连板数'])
-    pool=pool[pool['连板数']==2].copy()
-    if pool.empty: return pool
-    # 仅使用已获得的量化字段形成可核实的局部评分，绝不假装完整100分。
-    pool['已核实局部得分']=0.0
-    pool['可评分满分']=0
-    if '首次封板时间' in pool:
-        t=pool['首次封板时间'].map(time_num)
-        # 早封板是参考项，并非绝对越早越好。
-        points=t.map(lambda x: 10 if x is not None and x<=100000 else (6 if x is not None and x<=110000 else (3 if x is not None else 0)))
-        pool['已核实局部得分']+=points
-        pool['可评分满分']+=10
-    if '炸板次数' in pool:
-        breaks=numeric(pool['炸板次数'])
-        pool['已核实局部得分']+=breaks.map(lambda x: 10 if pd.notna(x) and x==0 else (6 if pd.notna(x) and x==1 else (2 if pd.notna(x) and x==2 else 0)))
-        pool['可评分满分']+=10
-    if '换手率' in pool:
-        rate=numeric(pool['换手率'])
-        # 换手率仅是信息，不机械地把高换手当作好承接。
-        pool['换手率（供人工判断）']=rate
-    pool=pool.sort_values(['已核实局部得分','代码'],ascending=[False,True])
-    return pool
+
+def build_pairs(zt_df, prev_df):
+    """把第 T 日二板与第 T+1 日的次日表现按代码匹配。"""
+    code_col = pick_col(zt_df, ['代码'])
+    board_col = pick_col(zt_df, ['连板数'])
+    if code_col is None or board_col is None:
+        raise ValueError('第 T 日涨停池缺少「代码」或「连板数」字段')
+
+    boards = zt_df[zt_df[board_col].apply(pd.to_numeric, errors='coerce') == 2]
+    two = boards[[code_col]].rename(columns={code_col: '代码'}).copy()
+    two['代码'] = two['代码'].astype(str).str.zfill(6)
+
+    p_code = pick_col(prev_df, ['代码'])
+    p_chg = pick_col(prev_df, ['涨跌幅'])
+    p_zb = pick_col(prev_df, ['是否炸板', '昨日炸板', '炸板次数'])
+    if p_code is None or p_chg is None:
+        raise ValueError(f'昨日涨停池缺少必要字段，实际字段：{list(prev_df.columns)}')
+
+    nxt = prev_df[[c for c in [p_code, p_chg, p_zb] if c is not None]].copy()
+    nxt = nxt.rename(columns={p_code: '代码', p_chg: '次日涨跌幅'})
+    nxt['代码'] = nxt['代码'].astype(str).str.zfill(6)
+    nxt['次日涨跌幅'] = pd.to_numeric(nxt['次日涨跌幅'], errors='coerce')
+
+    merged = two.merge(nxt, on='代码', how='left', indicator=True)
+    merged['匹配'] = merged['_merge'].eq('both')
+    merged = merged.drop(columns='_merge')
+    return merged
+
+
+def summarize(merged):
+    matched = merged[merged['匹配']]
+    n = len(matched)
+    total = len(merged)
+    if n == 0:
+        return {'二板总数': total, '匹配样本': 0}
+
+    chg = matched['次日涨跌幅']
+    return {
+        '二板总数': total,
+        '匹配样本': n,
+        '未匹配样本': total - n,
+        '次日平均涨跌幅(%)': round(chg.mean(), 2),
+        '次日中位数涨跌幅(%)': round(chg.median(), 2),
+        '次日上涨比例(%)': round((chg > 0).mean() * 100, 1),
+        '次日涨停(≥9.8%)比例(%)': round((chg >= 9.8).mean() * 100, 1),
+        '次日跌超5%比例(%)': round((chg <= -5).mean() * 100, 1),
+    }
+
 
 with st.sidebar:
-    st.header('筛选设置')
-    day=st.date_input('行情日期（建议已收盘交易日）',value=dt.date.today(),max_value=dt.date.today())
-    st.info('免费涨停池数据可能延迟、停用或字段变更。请先核实日期与完整性。')
-    run=st.button('🔎 开始自动筛选',type='primary',use_container_width=True)
+    st.header('统计设置')
+    day = st.date_input('第 T 日（二板日）', value=dt.date.today() - dt.timedelta(days=1),
+                        max_value=dt.date.today())
+    st.caption('次日 T+1 自动取下一个交易日的「昨日涨停股池」，需要 T+1 已收盘。')
+    run = st.button('📊 开始统计', type='primary', use_container_width=True)
 
 if not run:
-    st.info('选择交易日期后，点击左侧「开始自动筛选」。手机上点击左上角箭头可打开设置。')
-    st.subheader('三层确认状态')
-    st.write('第一层：主线与梯队 → **待核实**（当前免费接口只提供行业代理信息）')
-    st.write('第二层：真正二板候选 → **待运行**；核心100分 → **只显示可验证的局部得分**')
-    st.write('第三层：分时放量、缩量分歧、强回封 → **未接入实时分钟数据，不能确认**')
+    st.info('选择第 T 日后点击「开始统计」。需确保 T+1 日已收盘，否则次日数据不完整。')
     st.stop()
 
+day_str = day.strftime('%Y%m%d')
 try:
-    with st.spinner('正在获取免费涨停池数据…'):
-        raw=load_pool(day)
-    st.success(f'获取成功：{day}，涨停池 {len(raw)} 条（接口返回数，非全市场涨停家数保证值）。')
-    if day==dt.date.today():
-        st.warning('当日数据可能尚未最终更新，尤其盘中不能据此确认连续二板。')
-    c1,c2,c3=st.columns(3)
-    c1.metric('接口涨停池记录',len(raw))
-    boards=numeric(raw['连板数']) if '连板数' in raw else pd.Series(dtype=float)
-    c2.metric('连续二板候选',int((boards==2).sum()))
-    c3.metric('买点状态','未确认')
-    st.subheader('第一层｜板块观察（仅行业代理，不等于真实题材）')
-    if '所属行业' in raw:
-        sectors=raw.groupby('所属行业',dropna=False).agg(该行业涨停数=('代码','count'),该行业二板数=('连板数',lambda s:int((numeric(s)==2).sum()))).sort_values(['该行业涨停数','该行业二板数'],ascending=False)
-        st.dataframe(sectors.head(25),use_container_width=True)
-        st.warning('「所属行业」不是低空经济、密码安全等概念板块。当前无法自动核实具体题材、消息催化和同步封板，第一层保持「待核实」。')
-    else:
-        st.warning('接口未提供所属行业字段，第一层无法自动判断。')
-    st.subheader('第二层｜真正2天2板候选')
-    candidates=analyze(raw)
-    if candidates.empty:
-        st.warning('本次数据没有发现连板数=2的记录。若数据不完整，不能据此断言市场没有二板。')
-    else:
-        preferred=['代码','名称','所属行业','首次封板时间','最后封板时间','炸板次数','换手率','成交额','连板数','已核实局部得分','可评分满分']
-        st.dataframe(candidates[[c for c in preferred if c in candidates.columns]],use_container_width=True,hide_index=True)
-        st.caption('局部得分仅为封板时间与炸板次数的启发式参考，不是完整100分，也不是上涨概率；不得据此直接选唯一核心。')
-        csv=candidates.to_csv(index=False).encode('utf-8-sig')
-        st.download_button('下载二板候选CSV',csv,file_name=f'二板候选_{day}.csv',mime='text/csv')
-    st.subheader('第三层｜买点确认')
-    st.warning('缺少竞价、逐分钟量价、细分题材同步与历史盘口证据：买点未确认。**只观察，不买入。**')
-    st.error('最终结论：当前数据不足以确认唯一可交易核心；今天没有已验证的合格买点，空仓。')
-    with st.expander('查看原始行情数据与字段'):
-        st.write(list(raw.columns))
-        st.dataframe(raw,use_container_width=True)
+    with st.spinner('正在获取涨停池数据…'):
+        zt = fetch_zt(day_str)
+        # T+1 的昨日涨停股池：传入 T+1 日期，返回的是 T 日涨停股在 T+1 的表现
+        next_day = day + dt.timedelta(days=1)
+        prev = fetch_prev(next_day.strftime('%Y%m%d'))
+
+    if zt is None or zt.empty:
+        raise ValueError('第 T 日未返回涨停池数据（可能是非交易日或接口异常）')
+    if prev is None or prev.empty:
+        raise ValueError('T+1 日未返回昨日涨停股池（可能尚未收盘或非交易日）')
+
+    st.caption(f'接口返回字段（昨日涨停池）：{list(prev.columns)}')
+
+    merged = build_pairs(zt, prev)
+    s = summarize(merged)
+
+    st.subheader('统计结果')
+    cols = st.columns(3)
+    keys = list(s.keys())
+    for i, k in enumerate(keys):
+        cols[i % 3].metric(k, s[k])
+
+    if s.get('匹配样本', 0) < 30:
+        st.warning('匹配样本少于 30，统计结果波动很大，不建议据此判断规律。')
+    if s.get('未匹配样本', 0) > 0:
+        st.info(f"有 {s['未匹配样本']} 只二板在次日表现中未匹配，请检查是否为接口缺失或代码格式问题。")
+
+    st.subheader('明细')
+    st.dataframe(merged, use_container_width=True, hide_index=True)
+    st.download_button(
+        '下载明细CSV',
+        merged.to_csv(index=False).encode('utf-8-sig'),
+        file_name=f'二板次日_{day_str}.csv',
+        mime='text/csv',
+    )
+    st.caption('仅为历史统计，不代表未来表现，不构成投资建议。')
+
 except Exception as exc:
-    st.error('免费行情接口未成功返回有效数据。系统不会伪造候选或评分。')
+    st.error('统计失败，未生成结果。')
     st.code(f'{type(exc).__name__}: {exc}')
-    st.info('可尝试选择最近一个已收盘交易日，或稍后重试。接口故障不代表当天没有机会。')
